@@ -34,3 +34,8 @@ The tests need local loopback ports for mocked transports. Commit only reviewed
 source, documentation, and tests, then push to `origin`. Never force-push.
 The public repository excludes environment files, login tokens, account state,
 conversation archives, logs, attachments, and generated task outputs.
+
+The owner has not granted GitHub Actions workflow permission. CI configurations
+are preserved as ordinary examples in `docs/ci-examples/`, not installed as active
+GitHub workflows. Run checks locally before pushing. Scheduled hourly sync is
+disabled; synchronization happens when authorized project changes are completed.

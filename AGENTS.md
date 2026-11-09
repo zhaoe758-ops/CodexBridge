@@ -21,3 +21,7 @@ task complete. Report any failed checks or blocked push honestly.
 - Keep live service configuration outside Git; document portable setup steps.
 - If another task is editing these files, do not commit its unfinished work.
 - Tests assume UTC: use `TZ=UTC node scripts/test.mjs <relevant test files>`.
+- The owner declined GitHub Actions workflow permission. Keep CI examples in
+  `docs/ci-examples/`; do not create `.github/workflows/` or request workflow scope.
+- The owner cancelled scheduled synchronization. Push as part of completing
+  authorized project changes; do not create an hourly sync automation.
