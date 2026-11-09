@@ -49,6 +49,7 @@ interface CodexProviderProfileConfig extends Record<string, unknown> {
   modelCatalog?: unknown[];
   modelCatalogMode?: 'merge' | 'overlay-only';
   defaultModel?: string | null;
+  disabledFeatures?: string[];
 }
 
 type CodexProviderProfile = ProviderProfile & {
@@ -101,6 +102,7 @@ export class CodexProviderPlugin {
       autolaunch: profile.config.autolaunch ?? false,
       modelCatalog: profile.config.modelCatalog ?? [],
       modelCatalogMode: profile.config.modelCatalogMode ?? 'merge',
+      disabledFeatures: profile.config.disabledFeatures ?? [],
       logger: createStderrLogger(),
     }),
     reviewRunner = new CodexCliReviewRunner(),

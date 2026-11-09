@@ -8,6 +8,7 @@ import { formatPlatformScopeKey } from './contracts.js';
 import { isAgentCommandEnabled } from './command_availability.js';
 import { parseSlashCommand } from './command_parser.js';
 import { NotFoundError } from './errors.js';
+import { abortable } from './abortable.js';
 import {
   buildLegacyReadOnlyCustomSettingsUpdate,
   buildPermissionsSettingsUpdate,
@@ -215,6 +216,8 @@ type CoordinatorResponse = {
 };
 
 type StartTurnOptions = {
+  signal?: AbortSignal;
+  runtimeWorkCancelled?: boolean;
   onProgress?: ((progress: ProviderTurnProgress) => Promise<void> | void) | null;
   onTurnStarted?: (meta: {
     turnId: string | null;
@@ -1142,10 +1145,15 @@ export class BridgeCoordinator {
     return lines.join('\n');
   }
 
-  async handleConversationTurn(event, options = {}) {
+  async handleConversationTurn(event, options: StartTurnOptions = {}) {
+    options.signal?.throwIfAborted();
     const scopeRef = toScopeRef(event);
     const providerProfile = this.resolveScopeProviderProfile(scopeRef);
-    const targetedEvent = await this.rewriteConversationEventForExplicitPluginTarget(event, providerProfile);
+    const targetedEvent = await abortable(
+      () => this.rewriteConversationEventForExplicitPluginTarget(event, providerProfile),
+      options.signal,
+    );
+    options.signal?.throwIfAborted();
     debugCoordinator('conversation_turn_begin', {
       platform: scopeRef.platform,
       scopeId: scopeRef.externalScopeId,
@@ -1173,6 +1181,7 @@ export class BridgeCoordinator {
       return this.handleUploadsConversationTurn(effectiveEvent, scopeRef, currentSession, uploadState, options);
     }
     const activeTurn = await this.reconcileActiveTurn(scopeRef);
+    options.signal?.throwIfAborted();
     if (activeTurn) {
       debugCoordinator('conversation_turn_blocked_active_turn', {
         platform: scopeRef.platform,
@@ -1181,7 +1190,11 @@ export class BridgeCoordinator {
       });
       return this.buildActiveTurnBlockedResponse(effectiveEvent, activeTurn);
     }
-    const explicitPluginIssueResponse = await this.buildExplicitPluginIssueResponse(effectiveEvent, providerProfile);
+    const explicitPluginIssueResponse = await abortable(
+      () => this.buildExplicitPluginIssueResponse(effectiveEvent, providerProfile),
+      options.signal,
+    );
+    options.signal?.throwIfAborted();
     if (explicitPluginIssueResponse) {
       debugCoordinator('conversation_turn_blocked_plugin_unavailable', {
         platform: scopeRef.platform,
@@ -1209,6 +1222,7 @@ export class BridgeCoordinator {
           },
         });
       }
+      options.signal?.throwIfAborted();
       debugCoordinator('conversation_turn_session_resolved', {
         platform: scopeRef.platform,
         scopeId: scopeRef.externalScopeId,
@@ -1251,6 +1265,14 @@ export class BridgeCoordinator {
       localTurnFinished = isTurnResultLocallyFinished(result);
       return response;
     } catch (error) {
+      if (options.signal?.aborted && error === options.signal.reason) {
+        // No provider turn was started; do not reconcile over another network RPC.
+        if (localActiveTurn && !localActiveTurn.turnId
+          && this.activeTurns?.resolveScopeTurn(scopeRef) === localActiveTurn) {
+          this.activeTurns.endScopeTurn(scopeRef);
+        }
+        throw error;
+      }
       const failure = classifyTurnFailure(error, this.currentI18n);
       debugCoordinator('conversation_turn_failure', {
         platform: scopeRef.platform,
@@ -1287,7 +1309,7 @@ export class BridgeCoordinator {
     return { event, response: null };
   }
 
-  async handleCommand(event, command, options = {}) {
+  async handleCommand(event, command, options: StartTurnOptions = {}) {
     const commandName = normalizeCommandName(command.name);
     if (commandName !== 'helps' && command.args.some((arg) => isHelpFlag(arg))) {
       return this.handleHelpsCommand(event, [commandName]);
@@ -1319,7 +1341,7 @@ export class BridgeCoordinator {
         return this.handleAssistantCommand(event, command.args, 'note');
       case 'stop':
       case 'interrupt':
-        return this.handleStopCommand(event);
+        return this.handleStopCommand(event, options);
       case 'review':
         return this.handleReviewCommand(event, command.args, options);
       case 'agent':
@@ -5934,12 +5956,15 @@ export class BridgeCoordinator {
     return this.handleAllowCommand(event, ['3', String(requestIndex)]);
   }
 
-  async handleStopCommand(event) {
+  async handleStopCommand(event, options: StartTurnOptions = {}) {
     const scopeRef = toScopeRef(event);
+    const noActiveMessage = this.t(options.runtimeWorkCancelled
+      ? 'coordinator.stop.cancelledRequest'
+      : 'coordinator.stop.none');
     const active = await this.reconcileActiveTurn(scopeRef);
     const session = this.bridgeSessions.resolveScopeSession(scopeRef);
     if (!active && !session) {
-      return messageResponse([this.t('coordinator.stop.none')], this.buildScopedSessionMeta(event));
+      return messageResponse([noActiveMessage], this.buildScopedSessionMeta(event));
     }
     if (!session) {
       if (active?.interruptRequested) {
@@ -5963,14 +5988,14 @@ export class BridgeCoordinator {
           ], buildActiveTurnMeta(active));
         }
       }
-      return messageResponse([this.t('coordinator.stop.none')], this.buildScopedSessionMeta(event));
+      return messageResponse([noActiveMessage], this.buildScopedSessionMeta(event));
     }
     const stopResult = await this.stopThreadForSession(scopeRef, session);
     if (stopResult.interruptedTurnIds.length === 0 && !stopResult.requestedWhileStarting) {
       if (active?.interruptRequested) {
         return messageResponse([this.t('coordinator.stop.alreadyRequested')], buildActiveTurnMeta(active) ?? buildSessionMeta(session));
       }
-      return messageResponse([this.t('coordinator.stop.none')], buildActiveTurnMeta(active) ?? buildSessionMeta(session));
+      return messageResponse([noActiveMessage], buildActiveTurnMeta(active) ?? buildSessionMeta(session));
     }
     const lines: string[] = [];
     if (stopResult.interruptedTurnIds.length > 1) {
@@ -5992,7 +6017,7 @@ export class BridgeCoordinator {
       lines.push(this.t('coordinator.stop.partialFailed', { error: stopResult.interruptErrors[0] }));
     }
     if (lines.length === 0) {
-      lines.push(this.t('coordinator.stop.none'));
+      lines.push(noActiveMessage);
     }
     return messageResponse(lines, buildActiveTurnMeta(active) ?? buildSessionMeta(session));
   }
@@ -11408,6 +11433,7 @@ export class BridgeCoordinator {
   }
 
   async startTurnWithRecovery(scopeRef, session, event, options: StartTurnOptions = {}) {
+    options.signal?.throwIfAborted();
     const stopCheckpoint = session ? this.resolveStopCheckpoint(session.id) : null;
     const shouldLazyResumeStoppedThread = Boolean(
       stopCheckpoint
@@ -11426,6 +11452,7 @@ export class BridgeCoordinator {
     try {
       return await this.startTurnOnSession(session, event, options);
     } catch (error) {
+      options.signal?.throwIfAborted();
       debugCoordinator('turn_recovery_error', {
         platform: scopeRef.platform,
         scopeId: scopeRef.externalScopeId,
@@ -11451,6 +11478,7 @@ export class BridgeCoordinator {
   }
 
   async startTurnOnSession(session, event, options: StartTurnOptions = {}) {
+    options.signal?.throwIfAborted();
     const scopeRef = toScopeRef(event);
     const providerProfile = this.requireProviderProfile(session.providerProfileId);
     const providerPlugin = this.providerRegistry.getProvider(providerProfile.providerKind);
@@ -11493,6 +11521,7 @@ export class BridgeCoordinator {
     let result;
     while (true) {
       try {
+        options.signal?.throwIfAborted();
         result = await providerPlugin.startTurn({
           providerProfile,
           bridgeSession: session,
@@ -11532,6 +11561,9 @@ export class BridgeCoordinator {
                 providerProfileId: session.providerProfileId,
               });
             }
+            if (options.signal?.aborted && active) {
+              this.activeTurns?.requestInterrupt(scopeRef);
+            }
             if (active?.interruptRequested && active.turnId && !active.interruptDispatched) {
               await this.dispatchInterruptForActiveTurn(active);
             }
@@ -11544,6 +11576,7 @@ export class BridgeCoordinator {
           },
         });
       } catch (error) {
+        options.signal?.throwIfAborted();
         const failureMessage = formatUserError(error);
         if (
           !attemptedModelReset

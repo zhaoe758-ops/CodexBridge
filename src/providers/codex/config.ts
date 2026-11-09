@@ -17,6 +17,7 @@ interface CodexProviderConfig {
   launchCommand: string | null;
   autolaunch: boolean;
   defaultModel: string | null;
+  disabledFeatures: string[];
   providerLabel: string;
   backendBaseUrl: string | null;
   apiKeyEnv: string | null;
@@ -90,7 +91,10 @@ export function loadCodexProfilesFromEnv(
         cliBin: codexRealBin,
         launchCommand: normalizeString(env.CODEX_APP_LAUNCH_CMD),
         autolaunch: parseBoolean(env.CODEX_APP_AUTOLAUNCH, false),
-        defaultModel: null,
+        defaultModel: normalizeString(env.CODEX_OPENAI_DEFAULT_MODEL),
+        disabledFeatures: parseBoolean(env.CODEX_OPENAI_DISABLE_IMAGE_GENERATION, true)
+          ? ['image_generation']
+          : [],
         providerLabel: 'openai',
         backendBaseUrl: null,
         apiKeyEnv: null,

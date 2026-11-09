@@ -20,6 +20,7 @@ import {
   transitionMission,
 } from '../../packages/mission-control/src/index.js';
 import { createCodexBridgeRuntime } from '../../src/runtime/bootstrap.js';
+import { WeixinBridgeRuntime } from '../../src/runtime/weixin_bridge_runtime.js';
 
 function normalizeCommandSkillInput(value: unknown) {
   return String(value ?? '').replace(/\\/g, '/');
@@ -5725,6 +5726,80 @@ test('/stop reports when there is no active turn to interrupt', async () => {
   });
 
   assert.equal(result.messages[0]?.text ?? '', '当前没有进行中的回复。');
+});
+
+test('Weixin /stop cancels preparation before active-turn registration without starting the old request later', { timeout: 2000 }, async () => {
+  const { runtime, openai } = makeRuntime();
+  const coordinator = runtime.services.bridgeCoordinator;
+  const sent: string[] = [];
+  let preparationStarted: () => void;
+  let releasePreparation: () => void;
+  const ready = new Promise<void>((resolve) => { preparationStarted = resolve; });
+  const gate = new Promise<void>((resolve) => { releasePreparation = resolve; });
+  const rewrite = coordinator.rewriteConversationEventForExplicitPluginTarget.bind(coordinator);
+  coordinator.rewriteConversationEventForExplicitPluginTarget = async (event, profile) => {
+    if (event.text === 'old question') {
+      preparationStarted();
+      await gate;
+    }
+    return rewrite(event, profile);
+  };
+  const bridge = new WeixinBridgeRuntime({
+    bridgeCoordinator: coordinator,
+    platformPlugin: {
+      async sendText({ content }) { sent.push(content); return { success: true, deliveredText: content }; },
+    },
+  });
+  const scope = { platform: 'weixin', externalScopeId: 'wx-stop-preparation' };
+  const old = await bridge.dispatchInboundEvent({ ...scope, text: 'old question' });
+  await ready;
+  assert.equal(runtime.services.activeTurns.resolveScopeTurn(scope), null);
+  await bridge.dispatchInboundEvent({ ...scope, text: '/stop' });
+  await old.completion;
+  const next = await bridge.dispatchInboundEvent({ ...scope, text: 'new question' });
+  await next.completion;
+  releasePreparation();
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(openai.startTurnCalls.map((call) => call.inputText), ['new question']);
+  assert.deepEqual(sent, ['已停止当前请求及待发送的回复，可以继续提问。', 'openai: new question']);
+});
+
+test('Weixin /stop interrupts a running provider turn after cancelling the local wait', { timeout: 2000 }, async () => {
+  const { runtime, openai } = makeRuntime();
+  const coordinator = runtime.services.bridgeCoordinator;
+  const sent: string[] = [];
+  let started: () => void;
+  let release: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const gate = new Promise<void>((resolve) => { release = resolve; });
+  openai.startTurn = async ({ bridgeSession, onTurnStarted }) => {
+    const thread = openai.threads.get(bridgeSession.codexThreadId);
+    thread.turns = [{ id: 'running-turn', status: 'running', items: [] }];
+    await onTurnStarted({ turnId: 'running-turn', threadId: thread.id });
+    started();
+    await gate;
+    return { outputText: '', outputState: 'interrupted', threadId: thread.id, turnId: 'running-turn', title: bridgeSession.title };
+  };
+  openai.interruptTurn = async (params) => {
+    openai.interruptTurnCalls.push(params);
+    openai.threads.get(params.threadId).turns[0].status = 'interrupted';
+    release();
+  };
+  const bridge = new WeixinBridgeRuntime({
+    bridgeCoordinator: coordinator,
+    platformPlugin: {
+      async sendText({ content }) { sent.push(content); return { success: true, deliveredText: content }; },
+    },
+  });
+  const scope = { platform: 'weixin', externalScopeId: 'wx-stop-running' };
+  const pending = await bridge.dispatchInboundEvent({ ...scope, text: 'long question' });
+  await ready;
+  await bridge.dispatchInboundEvent({ ...scope, text: '/stop' });
+  await pending.completion;
+  assert.equal(openai.interruptTurnCalls.length, 1);
+  assert.equal(openai.interruptTurnCalls[0].turnId, 'running-turn');
+  assert.deepEqual(sent, ['已请求中断当前回复。']);
+  await waitForCondition(() => runtime.services.activeTurns.resolveScopeTurn(scope) === null);
 });
 
 test('/stop interrupts the active turn once the provider has issued a turn id', async () => {

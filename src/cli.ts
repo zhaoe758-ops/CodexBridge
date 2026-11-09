@@ -7,6 +7,7 @@ import QRCode from 'qrcode';
 import { WeixinAccountStore } from './platforms/weixin/account_store.js';
 import { WEIXIN_DEFAULT_BASE_URL, defaultCodexBridgeStateDir } from './platforms/weixin/config.js';
 import { WeixinPlatformPlugin } from './platforms/weixin/plugin.js';
+import { attachConversationArchive } from './platforms/weixin/conversation_archive.js';
 import { DEFAULT_ILINK_BOT_TYPE, officialQrLogin } from './platforms/weixin/official/login.js';
 import { clearContextTokensForAccount } from './platforms/weixin/official/context_tokens.js';
 import { createCodexBridgeRuntime } from './runtime/bootstrap.js';
@@ -231,6 +232,10 @@ async function runWeixinServe(args: string[]) {
     },
   });
   const platformPlugin = runtime.registry.getPlatform('weixin') as WeixinPlatformPlugin;
+  const conversationArchiveDir = process.env.CODEXBRIDGE_CONVERSATION_ARCHIVE_DIR?.trim();
+  if (conversationArchiveDir) {
+    attachConversationArchive(platformPlugin, conversationArchiveDir);
+  }
   const bridgeRuntime = new WeixinBridgeRuntime({
     platformPlugin,
     bridgeCoordinator: runtime.services.bridgeCoordinator,

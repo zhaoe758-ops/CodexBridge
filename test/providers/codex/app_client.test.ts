@@ -694,6 +694,31 @@ test('CodexAppClient startServer inherits the default Codex feature config when 
   assert.deepEqual(calls[0]?.args?.slice(1, 3), ['--listen', 'stdio://']);
 });
 
+test('CodexAppClient passes disabled features to app-server', async () => {
+  const calls = [];
+  const child = new EventEmitter() as EventEmitter & {
+    stderr: EventEmitter;
+    exitCode: number | null;
+  };
+  child.stderr = new EventEmitter();
+  child.exitCode = null;
+
+  const client = new CodexAppClient({
+    codexCliBin: 'codex',
+    disabledFeatures: ['image_generation'],
+    spawnImpl: ((command, args, options) => {
+      calls.push({ command, args, options });
+      return child as any;
+    }) as any,
+  });
+  client.connectWebSocket = async () => { client.connected = true; };
+  client.initialize = async () => {};
+
+  await client.startServer();
+
+  assert.deepEqual(calls[0]?.args?.slice(1, 4), ['--disable', 'image_generation', '--listen']);
+});
+
 test('CodexAppClient startServer prepends configured Codex CLI args', async () => {
   const calls = [];
   const child = new EventEmitter() as EventEmitter & {
@@ -1943,6 +1968,60 @@ test('CodexAppClient stdio wait ignores intermediate item completion until turn 
   assert.equal(result.finalSource, 'progress_only');
   assert.equal(sentFinal, true);
 });
+
+for (const status of ['interrupted', 'completed']) {
+  test(`CodexAppClient stdio wait returns for ${status} without assistant output and ignores other turns`, async () => {
+    let nowMs = 0;
+    let sentTerminal = false;
+    const client = new CodexAppClient({
+      codexCliBin: 'codex',
+      turnPollNow: () => nowMs,
+      turnPollSleep: async (ms) => {
+        nowMs += ms;
+        if (!sentTerminal && nowMs >= 1500) {
+          sentTerminal = true;
+          client.emit('notification', {
+            method: 'turn/completed',
+            params: {
+              threadId: 'thread-1',
+              turn: { id: 'turn-1', status },
+            },
+          });
+        } else if (!sentTerminal) {
+          client.emit('notification', {
+            method: 'turn/completed',
+            params: {
+              threadId: 'thread-1',
+              turn: { id: 'another-turn', status },
+            },
+          });
+        }
+      },
+    });
+    client.transportKind = 'stdio';
+    client.request = async (method) => {
+      if (method === 'turn/start') {
+        return { turn: { id: 'turn-1' } };
+      }
+      throw new Error(`Unexpected method: ${method}`);
+    };
+
+    const result = await client.startTurn({
+      threadId: 'thread-1',
+      inputText: 'hello',
+      model: 'gpt-5.4',
+      effort: null,
+      collaborationMode: 'default',
+      timeoutMs: 60_000,
+    });
+
+    assert.equal(result.outputText, '');
+    assert.equal(sentTerminal, true);
+    assert.equal(result.outputState, status === 'interrupted' ? 'interrupted' : 'missing');
+    assert.equal(result.finalSource, status === 'interrupted' ? 'turn_completed_notification' : 'none');
+    assert.equal(nowMs <= 2000, true);
+  });
+}
 
 test('CodexAppClient waits for assistant output after a terminal turn initially contains no visible items', async () => {
   const client = new CodexAppClient({

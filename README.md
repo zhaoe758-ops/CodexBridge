@@ -1,5 +1,7 @@
 # CodexBridge
 
+本仓库基于 [Gan-Xing/CodexBridge](https://github.com/Gan-Xing/CodexBridge)，保存微信桥接的本地维护版本。修复说明、双账号配置和同步约定见 [维护说明](docs/local-maintenance.md)。
+
 CodexBridge is a Codex-centered gateway for connecting multiple chat platforms to one shared Codex engine, while switching backend provider profiles inside Codex when needed.
 
 ## Current Direction
@@ -564,6 +566,8 @@ That file is the stable place to adjust:
 
 - `WEIXIN_ACCOUNT_ID`
 - `CODEX_DEFAULT_PROVIDER_PROFILE_ID`
+- `CODEX_OPENAI_DEFAULT_MODEL` (optional model override for `openai-default`; use a model supported by your configured Codex backend)
+- `CODEX_OPENAI_DISABLE_IMAGE_GENERATION` (defaults to `true` for the bridge; set to `false` only if your Codex backend supports the image generation tool, otherwise even text requests may fail with HTTP 403)
 - optional OpenAI-compatible provider keys such as `DEEPSEEK_*`, `MINIMAX_*`, `QWEN_*`, `OPENROUTER_*`, or `CODEX_COMPAT_*`
 - `CODEXBRIDGE_DEBUG_WEIXIN`
 

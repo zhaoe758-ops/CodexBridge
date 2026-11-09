@@ -12,3 +12,9 @@ coverage/
 .codexbridge/
 reports/
 reference/
+.codexbridge*/
+outputs/
+会话记录/
+*.log
+*.pem
+*.key

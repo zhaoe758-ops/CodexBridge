@@ -18,11 +18,29 @@ test('loadCodexProfilesFromEnv keeps Codex OpenAI as the default profile', () =>
   assert.equal(result.defaultProviderProfileId, 'openai-default');
   assert.equal(result.profiles[0]?.providerKind, 'openai-native');
   assert.equal(result.profiles[0]?.config.cliBin, '/usr/bin/codex');
+  assert.equal(result.profiles[0]?.config.defaultModel, null);
+  assert.deepEqual(result.profiles[0]?.config.disabledFeatures, ['image_generation']);
   assert.equal(result.profiles[1]?.id, 'compat-example');
   assert.equal(result.profiles[1]?.providerKind, 'openai-compatible');
   assert.equal(result.profiles[1]?.config.apiKeyEnv, 'CODEX_COMPAT_API_KEY');
   assert.equal(result.profiles[1]?.config.baseUrl, 'https://provider.example/v1');
   assert.equal(result.profiles[1]?.config.defaultModel, 'example-model');
+});
+
+test('loadCodexProfilesFromEnv can enable image generation for the native profile', () => {
+  const result = loadCodexProfilesFromEnv({
+    CODEX_OPENAI_DISABLE_IMAGE_GENERATION: 'false',
+  });
+  assert.deepEqual(result.profiles[0]?.config.disabledFeatures, []);
+});
+
+test('loadCodexProfilesFromEnv allows an explicit native model for a custom Codex backend', () => {
+  const result = loadCodexProfilesFromEnv({
+    CODEX_REAL_BIN: '/usr/bin/codex',
+    CODEX_OPENAI_DEFAULT_MODEL: ' gpt-6.1-sol ',
+  });
+  assert.equal(result.profiles[0]?.id, 'openai-default');
+  assert.equal(result.profiles[0]?.config.defaultModel, 'gpt-6.1-sol');
 });
 
 test('loadCodexProfilesFromEnv exposes multiple JSON-defined compatible providers', () => {

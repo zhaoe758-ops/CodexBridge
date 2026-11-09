@@ -290,6 +290,7 @@ interface CodexAppClientOptions {
   modelCatalog?: CodexModelInfo[];
   modelCatalogMode?: 'merge' | 'overlay-only';
   enabledFeatures?: string[];
+  disabledFeatures?: string[];
   clientInfo?: CodexClientInfo;
   spawnImpl?: typeof spawn;
   webSocketFactory?: (url: string) => WebSocket;
@@ -327,6 +328,8 @@ export class CodexAppClient extends EventEmitter {
   modelCatalogMode: 'merge' | 'overlay-only';
 
   enabledFeatures: string[];
+
+  disabledFeatures: string[];
 
   clientInfo: CodexClientInfo;
 
@@ -378,6 +381,7 @@ export class CodexAppClient extends EventEmitter {
     modelCatalog = [],
     modelCatalogMode = 'merge',
     enabledFeatures = [],
+    disabledFeatures = [],
     clientInfo = {
       name: 'codexbridge',
       title: 'CodexBridge',
@@ -399,6 +403,7 @@ export class CodexAppClient extends EventEmitter {
     this.modelCatalog = modelCatalog;
     this.modelCatalogMode = modelCatalogMode;
     this.enabledFeatures = normalizeFeatureList(enabledFeatures);
+    this.disabledFeatures = normalizeFeatureList(disabledFeatures);
     this.clientInfo = clientInfo;
     this.spawnImpl = spawnImpl;
     this.webSocketFactory = webSocketFactory;
@@ -1173,7 +1178,10 @@ export class CodexAppClient extends EventEmitter {
     this.childStderrTail = [];
     this.stdioLineBuffer = '';
     this.port = transportKind === 'websocket' ? await reservePort() : null;
-    const featureArgs = this.enabledFeatures.flatMap((feature) => ['--enable', feature]);
+    const featureArgs = [
+      ...this.enabledFeatures.flatMap((feature) => ['--enable', feature]),
+      ...this.disabledFeatures.flatMap((feature) => ['--disable', feature]),
+    ];
     const appServerArgs = transportKind === 'websocket'
       ? [...this.codexCliArgs, 'app-server', ...featureArgs, '--listen', `ws://127.0.0.1:${this.port}`]
       : [...this.codexCliArgs, 'app-server', ...featureArgs, '--listen', 'stdio://'];
@@ -1724,10 +1732,15 @@ export class CodexAppClient extends EventEmitter {
     };
     const itemOutputKinds = new Map();
     let sawTerminalNotification = false;
+    let terminalNotificationStatus: string | null = null;
+    let terminalNotificationAt: number | null = null;
     let terminalRuntimeError: string | null = null;
     const onNotification = (notification) => {
       if (isTerminalNotificationForThread(notification, threadId, turnId)) {
         sawTerminalNotification = true;
+        terminalNotificationAt ??= this.turnPollNow();
+        terminalNotificationStatus = notification?.params?.turn?.status ?? 'completed';
+        terminalRuntimeError = extractTextCandidate(notification?.params?.turn?.error);
       }
       if (isErrorNotificationForThreadTurn(notification, threadId, turnId)) {
         const notificationErrorMessage = extractNotificationErrorMessage(notification);
@@ -1910,16 +1923,32 @@ export class CodexAppClient extends EventEmitter {
           return result;
         }
         if (includeTurnsUnsupported) {
+          if (classifyTurnCompletionState({ status: terminalNotificationStatus }) === 'interrupted') {
+            const result = {
+              turnId,
+              threadId,
+              title: thread?.title ?? null,
+              outputText: '',
+              outputArtifacts: [],
+              outputMedia: [],
+              outputState: 'interrupted',
+              previewText: progressState.finalAnswerText,
+              finalSource: 'turn_completed_notification',
+              status: terminalNotificationStatus,
+            };
+            this.logDebug('turn_wait_return', summarizeTurnResultForDebug(result));
+            return result;
+          }
           const previewText = progressState.finalAnswerText || progressState.commentaryText;
           const settleAnchor = Math.max(
             includeTurnsUnsupportedAt,
+            terminalNotificationAt ?? 0,
             progressState.lastAssistantActivityAt || 0,
           );
-          const settleElapsedMs = settleAnchor ? this.turnPollNow() - settleAnchor : 0;
+          const settleElapsedMs = this.turnPollNow() - settleAnchor;
           if (
             (
               !sawTerminalNotification
-              || !previewText
               || settleElapsedMs < 500
             )
             && this.turnPollNow() + 250 < deadline
@@ -3541,7 +3570,8 @@ function isTerminalNotificationForThread(
   }
   const method = String(notification?.method ?? '').replace(/[^a-z]/gi, '').toLowerCase();
   if (method === 'turncompleted') {
-    return true;
+    const notificationTurnId = extractNotificationTurnId(notification?.params ?? null);
+    return !notificationTurnId || notificationTurnId === turnId;
   }
   return false;
 }
@@ -4275,6 +4305,9 @@ function extractNotificationTurnId(params) {
   const direct = typeof params?.turnId === 'string' ? params.turnId : null;
   if (direct) {
     return direct;
+  }
+  if (typeof params?.turn?.id === 'string' && params.turn.id) {
+    return params.turn.id;
   }
   const nested = typeof params?.item?.turnId === 'string' ? params.item.turnId : null;
   if (nested) {

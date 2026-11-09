@@ -1,3 +1,5 @@
+import { AsyncLocalStorage } from 'node:async_hooks';
+import { abortable } from '../core/abortable.js';
 import { parseSlashCommand } from '../core/command_parser.js';
 import { isAgentCommandEnabled } from '../core/command_availability.js';
 import { writeSequencedDebugLog } from '../core/sequenced_stderr.js';
@@ -64,6 +66,8 @@ interface BridgeCoordinatorLike {
   handleInboundEvent(
     event: InboundTextEvent,
     options: {
+      signal?: AbortSignal;
+      runtimeWorkCancelled?: boolean;
       onProgress?: ((progress: ProviderTurnProgress) => Promise<void>) | null;
       onApprovalRequest?: ((request: ProviderApprovalRequest) => Promise<void>) | null;
     },
@@ -193,6 +197,10 @@ export class WeixinBridgeRuntime {
 
   scopeChains: Map<string, Promise<RuntimeResponse>>;
 
+  scopeControllers = new Map<string, Set<AbortController>>();
+
+  private workSignal = new AsyncLocalStorage<AbortSignal>();
+
   pendingInboundMerges: Map<string, PendingInboundMerge>;
 
   pendingScopeNotices: Map<string, PendingScopeNotice>;
@@ -315,7 +323,9 @@ export class WeixinBridgeRuntime {
     }
     const command = parseSlashCommand(String(event?.text ?? ''));
     if (command) {
-      await this.flushPendingInboundMerge(event.externalScopeId);
+      if (!isStopCommand(command)) {
+        await this.flushPendingInboundMerge(event.externalScopeId);
+      }
       if (shouldScheduleSlashCommand(command)) {
         const task = this.processInboundEventWithOptions(event, { deferPostResponseAction: true }).catch(async (error) => {
           await this.onError(error);
@@ -381,6 +391,10 @@ export class WeixinBridgeRuntime {
   scheduleInboundEvent(event: InboundTextEvent): Promise<RuntimeResponse> {
     const scopeId = String(event?.externalScopeId ?? '');
     if (!scopeId) {
+      return this.processInboundEvent(event);
+    }
+
+    if (isStopCommand(parseSlashCommand(String(event?.text ?? '')))) {
       return this.processInboundEvent(event);
     }
 
@@ -494,6 +508,19 @@ export class WeixinBridgeRuntime {
     await operation.catch(() => {});
   }
 
+  cancelPendingInboundMerge(externalScopeId: string): boolean {
+    const scopeId = String(externalScopeId ?? '');
+    const pending = this.pendingInboundMerges.get(scopeId);
+    if (!pending) {
+      return false;
+    }
+    this.pendingInboundMerges.delete(scopeId);
+    this.clearPendingInboundTimer(pending);
+    pending.resolve({ type: 'local_noop' });
+    debugRuntime('pending_inbound_merge_cancelled', { scopeId });
+    return true;
+  }
+
   async flushAllPendingInboundMerges(): Promise<void> {
     const scopeIds = [...this.pendingInboundMerges.keys()];
     if (scopeIds.length === 0) {
@@ -516,7 +543,15 @@ export class WeixinBridgeRuntime {
       suppressTyping?: boolean;
     } = {},
   ): Promise<RuntimeResponse> {
-    await this.flushPendingScopeNotice(event.externalScopeId);
+    const signal = this.workSignal.getStore();
+    const isStop = isStopCommand(parseSlashCommand(String(event?.text ?? '')));
+    const stoppedWork = isStop
+      ? this.cancelScopeWork(event.externalScopeId)
+      : false;
+    // Stop commands must reach the provider even if a previous notice cannot be sent.
+    if (!isStop) {
+      await abortable(() => this.flushPendingScopeNotice(event.externalScopeId), signal);
+    }
     const streamState = createStreamState();
     debugRuntime('process_inbound_event_start', {
       scopeId: event.externalScopeId,
@@ -532,17 +567,21 @@ export class WeixinBridgeRuntime {
       ? async () => {}
       : this.startTypingKeepalive(event.externalScopeId);
     try {
-      const response = await this.bridgeCoordinator.handleInboundEvent(event, {
+      const response = await abortable(() => this.bridgeCoordinator.handleInboundEvent(event, {
+        signal,
+        runtimeWorkCancelled: stoppedWork,
         onProgress: async (progress) => {
-          if (options.suppressProgressDelivery) {
+          if (options.suppressProgressDelivery || signal?.aborted) {
             return;
           }
-          await this.handleProgressUpdate(event, streamState, progress);
+          await this.workSignal.run(signal, () => this.handleProgressUpdate(event, streamState, progress));
         },
         onApprovalRequest: async () => {
-          await this.notifyApprovalPrompt(event);
+          if (!signal?.aborted) {
+            await this.workSignal.run(signal, () => this.notifyApprovalPrompt(event));
+          }
         },
-      });
+      }), signal);
       debugRuntime('coordinator_response', {
         scopeId: event.externalScopeId,
         type: response?.type ?? null,
@@ -635,8 +674,15 @@ export class WeixinBridgeRuntime {
       }
       return response;
     } finally {
-      await typingStart;
-      await stopTypingKeepalive();
+      streamState.previewStopped = true;
+      streamState.pendingPreview = '';
+      // Clear the timer before waiting on any in-flight typing HTTP request.
+      const typingStop = stopTypingKeepalive();
+      if (signal?.aborted) {
+        void typingStop;
+      } else {
+        await abortable(async () => { await typingStart; await typingStop; }, signal);
+      }
     }
   }
 
@@ -702,6 +748,12 @@ export class WeixinBridgeRuntime {
       return;
     }
     streamState.previewPumpPromise = this.runPreviewPump(event, streamState)
+      .catch((error) => {
+        const signal = this.workSignal.getStore();
+        if (!signal?.aborted || error !== signal.reason) {
+          throw error;
+        }
+      })
       .finally(() => {
         streamState.previewPumpPromise = null;
       });
@@ -1004,6 +1056,9 @@ export class WeixinBridgeRuntime {
   }
 
   async safeSendTyping(externalScopeId: string, status: 'start' | 'stop'): Promise<void> {
+    if (status === 'start' && this.workSignal.getStore()?.aborted) {
+      return;
+    }
     if (typeof this.platformPlugin.sendTyping !== 'function') {
       return;
     }
@@ -1036,7 +1091,10 @@ export class WeixinBridgeRuntime {
     externalScopeId: string;
     content: string;
   }): Promise<DeliveryResult> {
-    const result = await this.platformPlugin.sendText({ externalScopeId, content });
+    const result = await abortable(
+      () => this.platformPlugin.sendText({ externalScopeId, content }),
+      this.workSignal.getStore(),
+    );
     return this.normalizeTextDeliveryResult(result, content);
   }
 
@@ -1062,7 +1120,10 @@ export class WeixinBridgeRuntime {
     externalScopeId: string;
     content: string;
   }): Promise<DeliveryResult> {
-    const result = await this.platformPlugin.sendText({ externalScopeId, content });
+    const result = await abortable(
+      () => this.platformPlugin.sendText({ externalScopeId, content }),
+      this.workSignal.getStore(),
+    );
     return this.normalizeTextDeliveryResult(result, content);
   }
 
@@ -1097,11 +1158,11 @@ export class WeixinBridgeRuntime {
         attempt,
         maxAttempts,
       });
-      const result = await this.platformPlugin.sendMedia({
+      const result = await abortable(() => this.platformPlugin.sendMedia({
         externalScopeId,
         filePath,
         caption,
-      });
+      }), this.workSignal.getStore());
       lastResult = result;
       debugRuntime('artifact_delivery_result', {
         scopeId: externalScopeId,
@@ -1200,6 +1261,7 @@ export class WeixinBridgeRuntime {
   }
 
   async runPostResponseAction(response: RuntimeResponse, event: InboundTextEvent): Promise<void> {
+    this.workSignal.getStore()?.throwIfAborted();
     const action = response?.meta?.systemAction ?? null;
     if (!action) {
       return;
@@ -1235,7 +1297,21 @@ export class WeixinBridgeRuntime {
   ): Promise<RuntimeResponse> {
     const scopeId = String(externalScopeId ?? '');
     const previous = this.scopeChains.get(scopeId) ?? Promise.resolve();
-    const next = previous.catch(() => {}).then(operation);
+    const controller = new AbortController();
+    const controllers = this.scopeControllers.get(scopeId) ?? new Set<AbortController>();
+    controllers.add(controller);
+    this.scopeControllers.set(scopeId, controllers);
+    const next = this.workSignal.run(controller.signal, async () => {
+      try {
+        await abortable(() => previous.catch(() => {}), controller.signal);
+        return await abortable(operation, controller.signal);
+      } catch (error) {
+        if (controller.signal.aborted && error === controller.signal.reason) {
+          return { type: 'local_noop' };
+        }
+        throw error;
+      }
+    });
     this.scopeChains.set(scopeId, next);
     try {
       return await next;
@@ -1243,7 +1319,23 @@ export class WeixinBridgeRuntime {
       if (this.scopeChains.get(scopeId) === next) {
         this.scopeChains.delete(scopeId);
       }
+      controllers.delete(controller);
+      if (controllers.size === 0 && this.scopeControllers.get(scopeId) === controllers) {
+        this.scopeControllers.delete(scopeId);
+      }
     }
+  }
+
+  cancelScopeWork(scopeId: string): boolean {
+    const cancelledPending = this.cancelPendingInboundMerge(scopeId);
+    const controllers = this.scopeControllers.get(scopeId);
+    for (const controller of controllers ?? []) {
+      controller.abort();
+    }
+    this.scopeControllers.delete(scopeId);
+    this.scopeChains.delete(scopeId);
+    debugRuntime('scope_work_cancelled', { scopeId, cancelledPending, cancelledWork: Boolean(controllers?.size) });
+    return cancelledPending || Boolean(controllers?.size);
   }
 
   trackBackgroundTask(task: Promise<RuntimeResponse>): void {
@@ -2181,6 +2273,12 @@ function shouldScheduleSlashCommand(command: { name?: string | null; args?: stri
   }
   const args = Array.isArray(command?.args) ? command.args : [];
   return !args.some((arg) => ['-h', '--help', '-help', '-helps'].includes(String(arg ?? '').trim().toLowerCase()));
+}
+
+function isStopCommand(command: { name: string; args: string[] } | null): boolean {
+  return Boolean(command
+    && ['stop', 'interrupt'].includes(command.name.toLowerCase())
+    && !command.args.some((arg) => ['-h', '--help', '-help', '-helps'].includes(arg.toLowerCase())));
 }
 
 function shouldDelayInboundEvent(event: InboundTextEvent): boolean {

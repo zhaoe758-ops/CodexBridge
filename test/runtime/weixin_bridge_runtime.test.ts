@@ -489,8 +489,201 @@ test('WeixinBridgeRuntime dispatches plain-text turns in the background so slash
 
   assert.deepEqual(sent, [
     { externalScopeId: 'wxid_1', content: 'stop requested' },
-    { externalScopeId: 'wxid_1', content: 'final answer' },
   ]);
+});
+
+test('WeixinBridgeRuntime releases a stale scope after /stop and suppresses the old final reply', { timeout: 1500 }, async () => {
+  const sent: Array<{ externalScopeId: string; content: string }> = [];
+  let releaseFirstTurn: () => void = () => {};
+  const firstTurnGate = new Promise<void>((resolve) => {
+    releaseFirstTurn = resolve;
+  });
+  const runtime = makeRuntime({
+    sendText: async ({ externalScopeId, content }) => {
+      sent.push({ externalScopeId, content });
+    },
+    coordinator: {
+      async handleInboundEvent(event: any) {
+        if (event.text === 'hello') {
+          await firstTurnGate;
+          return completeResponse('stale final answer');
+        }
+        if (event.text === '你好') {
+          return completeResponse('new final answer');
+        }
+        return completeResponse('stop requested');
+      },
+    },
+  });
+
+  const first = await runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: 'hello',
+  });
+  assert.equal(first?.type, 'scheduled');
+
+  await runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: '/stop',
+  });
+  const next = await runtime.dispatchInboundEvent({
+    platform: 'weixin',
+    externalScopeId: 'wxid_1',
+    text: '你好',
+  });
+  assert.equal(next?.type, 'scheduled');
+
+  // The stopped work must settle without waiting for a stuck provider callback.
+  await first.completion;
+  await runtime.waitForIdle();
+  releaseFirstTurn();
+  await new Promise((resolve) => setImmediate(resolve));
+
+  assert.deepEqual(sent, [
+    { externalScopeId: 'wxid_1', content: 'stop requested' },
+    { externalScopeId: 'wxid_1', content: 'new final answer' },
+  ]);
+});
+
+test('WeixinBridgeRuntime /stop cancels a stalled final delivery and stops typing', { timeout: 1500 }, async () => {
+  const sent: string[] = [];
+  const typing: string[] = [];
+  let startDelivery: () => void;
+  let releaseDelivery: (value: any) => void;
+  const deliveryStarted = new Promise<void>((resolve) => { startDelivery = resolve; });
+  const deliveryGate = new Promise((resolve) => { releaseDelivery = resolve; });
+  const runtime = makeRuntime({
+    typingKeepaliveMs: 5,
+    coordinator: {
+      async handleInboundEvent(event: any, options: any) {
+        if (event.text === '/stop') {
+          assert.equal(options.runtimeWorkCancelled, true);
+          return completeResponse('stopped');
+        }
+        return completeResponse(event.text);
+      },
+    },
+    sendText: async ({ content }) => {
+      sent.push(content);
+      if (content === 'stalled reply') {
+        startDelivery();
+        return deliveryGate;
+      }
+    },
+    sendTyping: async ({ status }) => { typing.push(status); },
+  });
+  const first = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: 'stalled reply' });
+  await deliveryStarted;
+  await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '/stop' });
+  await first.completion;
+  await runtime.waitForIdle();
+  assert.equal(typing.at(-1), 'stop');
+  const count = typing.length;
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  assert.equal(typing.length, count);
+  const next = await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: 'new question' });
+  await next.completion;
+  // A late failed HTTP result must not trigger retries of the stopped response.
+  releaseDelivery({ success: false, error: 'late failure', deliveredText: '' });
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(sent, ['stalled reply', 'stopped', 'new question']);
+});
+
+test('WeixinBridgeRuntime /interrupt cancels pending images without starting a turn', { timeout: 1500 }, async () => {
+  const seen: string[] = [];
+  const sent: string[] = [];
+  const runtime = makeRuntime({
+    coordinator: {
+      async handleInboundEvent(event: any, options: any) {
+        seen.push(event.text);
+        assert.equal(options.runtimeWorkCancelled, true);
+        return completeResponse('stopped');
+      },
+    },
+    sendText: async ({ content }) => { sent.push(content); },
+  });
+  const pending = await runtime.dispatchInboundEvent({
+    platform: 'weixin', externalScopeId: 'wxid_1', text: '',
+    attachments: [{ kind: 'image', localPath: '/tmp/pending-image.png' }],
+  });
+  await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '/interrupt' });
+  await pending.completion;
+  await runtime.waitForIdle();
+  assert.deepEqual(seen, ['/interrupt']);
+  assert.deepEqual(sent, ['stopped']);
+});
+
+test('WeixinBridgeRuntime /stop releases a stuck typing request without clearing a newer scope task', { timeout: 1500 }, async () => {
+  let releaseTyping: () => void;
+  const typingGate = new Promise<void>((resolve) => { releaseTyping = resolve; });
+  let firstTyping = true;
+  let nextStarted: () => void;
+  let releaseNext: () => void;
+  const ready = new Promise<void>((resolve) => { nextStarted = resolve; });
+  const nextGate = new Promise<void>((resolve) => { releaseNext = resolve; });
+  const sent: string[] = [];
+  const runtime = makeRuntime({
+    coordinator: {
+      async handleInboundEvent(event: any) {
+        if (event.text === 'next') {
+          nextStarted();
+          await nextGate;
+        }
+        return completeResponse(event.text);
+      },
+    },
+    sendTyping: async ({ status }) => {
+      if (status === 'start' && firstTyping) {
+        firstTyping = false;
+        await typingGate;
+      }
+    },
+    sendText: async ({ content }) => { sent.push(content); },
+  });
+  const scope = { platform: 'weixin', externalScopeId: 'wxid_1' };
+  const first = await runtime.dispatchInboundEvent({ ...scope, text: 'first' });
+  await new Promise((resolve) => setImmediate(resolve));
+  await runtime.dispatchInboundEvent({ ...scope, text: '/stop' });
+  await first.completion;
+  const next = await runtime.dispatchInboundEvent({ ...scope, text: 'next' });
+  await ready;
+  releaseTyping();
+  await new Promise((resolve) => setImmediate(resolve));
+  const busy = await runtime.dispatchInboundEvent({ ...scope, text: 'third' });
+  await busy.completion;
+  assert.match(sent.at(-1), /当前已有一轮回复在进行中/);
+  releaseNext();
+  await next.completion;
+});
+
+test('WeixinBridgeRuntime direct /stop works while /stop --help leaves a turn running', { timeout: 1500 }, async () => {
+  const sent: string[] = [];
+  let signal: AbortSignal;
+  let started: () => void;
+  const ready = new Promise<void>((resolve) => { started = resolve; });
+  const runtime = makeRuntime({
+    coordinator: {
+      async handleInboundEvent(event: any, options: any) {
+        if (event.text === 'hello') {
+          signal = options.signal;
+          started();
+          return new Promise(() => {});
+        }
+        return completeResponse(event.text);
+      },
+    },
+    sendText: async ({ content }) => { sent.push(content); },
+  });
+  const pending = runtime.handleInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: 'hello' });
+  await ready;
+  await runtime.dispatchInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '/stop --help' });
+  assert.equal(signal.aborted, false);
+  await runtime.handleInboundEvent({ platform: 'weixin', externalScopeId: 'wxid_1', text: '/stop' });
+  await pending;
+  assert.equal(signal.aborted, true);
+  assert.deepEqual(sent, ['/stop --help', '/stop']);
 });
 
 test('WeixinBridgeRuntime swallows a single slash keepalive pulse without replying or forwarding to Codex', async () => {
